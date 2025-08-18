@@ -20,6 +20,14 @@
 (define-constant ERR_VENDOR_LIMIT_EXCEEDED (err u116))
 (define-constant ERR_INVALID_COMMISSION_RATE (err u117))
 (define-constant ERR_SETTLEMENT_FAILED (err u118))
+(define-constant ERR_DONATION_TOO_SMALL (err u119))
+(define-constant ERR_SPONSOR_NOT_FOUND (err u120))
+(define-constant ERR_SPONSOR_ALREADY_EXISTS (err u121))
+(define-constant ERR_SPONSORSHIP_EXPIRED (err u122))
+(define-constant ERR_SPONSORSHIP_INACTIVE (err u123))
+(define-constant ERR_INSUFFICIENT_SPONSOR_BALANCE (err u124))
+(define-constant ERR_INVALID_SPONSORSHIP_DURATION (err u125))
+(define-constant ERR_BENEFICIARY_ALREADY_SPONSORED (err u126))
 
 (define-constant MONTHLY_RATION_AMOUNT u1000000)
 (define-constant BLOCKS_PER_MONTH u4320)
@@ -31,6 +39,12 @@
 (define-constant VENDOR_CATEGORY_RESTAURANT u2)
 (define-constant VENDOR_CATEGORY_PHARMACY u3)
 (define-constant VENDOR_CATEGORY_MARKET u4)
+(define-constant MIN_DONATION_AMOUNT u10000)
+(define-constant MIN_SPONSORSHIP_DURATION u1)
+(define-constant MAX_SPONSORSHIP_DURATION u24)
+(define-constant SPONSORSHIP_TYPE_INDIVIDUAL u1)
+(define-constant SPONSORSHIP_TYPE_FAMILY u2)
+(define-constant SPONSORSHIP_TYPE_COMMUNITY u3)
 
 (define-data-var contract-owner principal CONTRACT_OWNER)
 (define-data-var total-cards-issued uint u0)
@@ -38,6 +52,10 @@
 (define-data-var current-distribution-cycle uint u0)
 (define-data-var total-vendors-registered uint u0)
 (define-data-var total-vendor-settlements uint u0)
+(define-data-var total-donations uint u0)
+(define-data-var total-sponsors uint u0)
+(define-data-var total-sponsorships uint u0)
+(define-data-var donation-fund-balance uint u0)
 
 (define-map ration-cards
   { card-id: uint }
@@ -126,6 +144,71 @@
   }
 )
 
+(define-map donation-registry
+  { donation-id: uint }
+  {
+    donor: principal,
+    amount: uint,
+    donation-date: uint,
+    donor-message: (string-ascii 200),
+    is-anonymous: bool,
+    allocation-target: uint
+  }
+)
+
+(define-map sponsor-registry
+  { sponsor-id: uint }
+  {
+    sponsor-address: principal,
+    organization-name: (string-ascii 100),
+    total-contributed: uint,
+    registration-date: uint,
+    is-active: bool,
+    sponsored-families: uint,
+    contact-info: (string-ascii 150)
+  }
+)
+
+(define-map sponsorship-agreements
+  { sponsorship-id: uint }
+  {
+    sponsor-id: uint,
+    beneficiary: principal,
+    card-id: uint,
+    sponsorship-amount: uint,
+    duration-months: uint,
+    start-date: uint,
+    end-date: uint,
+    is-active: bool,
+    sponsorship-type: uint,
+    monthly-payment: uint,
+    total-paid: uint,
+    last-payment-date: uint
+  }
+)
+
+(define-map donation-allocations
+  { allocation-id: uint }
+  {
+    donation-id: uint,
+    recipient-type: uint,
+    recipient-id: uint,
+    allocated-amount: uint,
+    allocation-date: uint,
+    is-distributed: bool
+  }
+)
+
+(define-map sponsor-address-lookup
+  { sponsor-address: principal }
+  { sponsor-id: uint }
+)
+
+(define-map beneficiary-sponsors
+  { beneficiary: principal }
+  { sponsorship-id: uint, sponsor-id: uint }
+)
+
 (define-private (get-current-cycle)
   (/ (- stacks-block-height u1) BLOCKS_PER_MONTH)
 )
@@ -176,6 +259,28 @@
 
 (define-private (calculate-commission (amount uint) (commission-rate uint))
   (/ (* amount commission-rate) u10000)
+)
+
+(define-private (is-valid-sponsorship-type (sponsorship-type uint))
+  (and (>= sponsorship-type SPONSORSHIP_TYPE_INDIVIDUAL) (<= sponsorship-type SPONSORSHIP_TYPE_COMMUNITY))
+)
+
+(define-private (calculate-sponsorship-end-date (start-date uint) (duration-months uint))
+  (+ start-date (* duration-months BLOCKS_PER_MONTH))
+)
+
+(define-private (is-sponsorship-expired (sponsorship-id uint))
+  (match (map-get? sponsorship-agreements { sponsorship-id: sponsorship-id })
+    sponsorship-data (>= stacks-block-height (get end-date sponsorship-data))
+    true
+  )
+)
+
+(define-private (get-sponsor-by-address (sponsor-address principal))
+  (match (map-get? sponsor-address-lookup { sponsor-address: sponsor-address })
+    address-data (map-get? sponsor-registry { sponsor-id: (get sponsor-id address-data) })
+    none
+  )
 )
 
 (define-public (issue-ration-card (beneficiary principal) (family-size uint) (validity-months uint))
@@ -628,3 +733,260 @@
 (define-read-only (is-vendor-registered (vendor-address principal))
   (is-some (map-get? vendor-address-lookup { vendor-address: vendor-address }))
 )
+
+(define-public (make-donation (amount uint) (message (string-ascii 200)) (is-anonymous bool) (target-allocation uint))
+  (let (
+    (donation-id (+ (var-get total-donations) u1))
+    (current-block stacks-block-height)
+  )
+    (asserts! (>= amount MIN_DONATION_AMOUNT) ERR_DONATION_TOO_SMALL)
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (try! (ft-transfer? foodpass-token amount tx-sender (as-contract tx-sender)))
+    
+    (map-set donation-registry
+      { donation-id: donation-id }
+      {
+        donor: tx-sender,
+        amount: amount,
+        donation-date: current-block,
+        donor-message: message,
+        is-anonymous: is-anonymous,
+        allocation-target: target-allocation
+      }
+    )
+    
+    (var-set total-donations donation-id)
+    (var-set donation-fund-balance (+ (var-get donation-fund-balance) amount))
+    (ok donation-id)
+  )
+)
+
+(define-public (register-sponsor (organization-name (string-ascii 100)) (contact-info (string-ascii 150)))
+  (let (
+    (sponsor-id (+ (var-get total-sponsors) u1))
+    (current-block stacks-block-height)
+  )
+    (asserts! (is-none (map-get? sponsor-address-lookup { sponsor-address: tx-sender })) ERR_SPONSOR_ALREADY_EXISTS)
+    
+    (map-set sponsor-registry
+      { sponsor-id: sponsor-id }
+      {
+        sponsor-address: tx-sender,
+        organization-name: organization-name,
+        total-contributed: u0,
+        registration-date: current-block,
+        is-active: true,
+        sponsored-families: u0,
+        contact-info: contact-info
+      }
+    )
+    
+    (map-set sponsor-address-lookup
+      { sponsor-address: tx-sender }
+      { sponsor-id: sponsor-id }
+    )
+    
+    (var-set total-sponsors sponsor-id)
+    (ok sponsor-id)
+  )
+)
+
+(define-public (create-sponsorship (beneficiary principal) (card-id uint) (sponsorship-amount uint) (duration-months uint) (sponsorship-type uint))
+  (let (
+    (sponsorship-id (+ (var-get total-sponsorships) u1))
+    (sponsor-lookup (unwrap! (map-get? sponsor-address-lookup { sponsor-address: tx-sender }) ERR_SPONSOR_NOT_FOUND))
+    (sponsor-id (get sponsor-id sponsor-lookup))
+    (sponsor-data (unwrap! (map-get? sponsor-registry { sponsor-id: sponsor-id }) ERR_SPONSOR_NOT_FOUND))
+    (card-data (unwrap! (map-get? ration-cards { card-id: card-id }) ERR_CARD_NOT_FOUND))
+    (current-block stacks-block-height)
+    (end-date (calculate-sponsorship-end-date current-block duration-months))
+    (monthly-payment (/ sponsorship-amount duration-months))
+  )
+    (asserts! (get is-active sponsor-data) ERR_SPONSOR_NOT_FOUND)
+    (asserts! (is-eq (get beneficiary card-data) beneficiary) ERR_INVALID_BENEFICIARY)
+    (asserts! (get is-active card-data) ERR_CARD_INACTIVE)
+    (asserts! (not (is-card-expired card-id)) ERR_CARD_EXPIRED)
+    (asserts! (is-valid-sponsorship-type sponsorship-type) ERR_INVALID_SPONSORSHIP_DURATION)
+    (asserts! (and (>= duration-months MIN_SPONSORSHIP_DURATION) (<= duration-months MAX_SPONSORSHIP_DURATION)) ERR_INVALID_SPONSORSHIP_DURATION)
+    (asserts! (> sponsorship-amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (is-none (map-get? beneficiary-sponsors { beneficiary: beneficiary })) ERR_BENEFICIARY_ALREADY_SPONSORED)
+    
+    (try! (ft-transfer? foodpass-token sponsorship-amount tx-sender (as-contract tx-sender)))
+    
+    (map-set sponsorship-agreements
+      { sponsorship-id: sponsorship-id }
+      {
+        sponsor-id: sponsor-id,
+        beneficiary: beneficiary,
+        card-id: card-id,
+        sponsorship-amount: sponsorship-amount,
+        duration-months: duration-months,
+        start-date: current-block,
+        end-date: end-date,
+        is-active: true,
+        sponsorship-type: sponsorship-type,
+        monthly-payment: monthly-payment,
+        total-paid: u0,
+        last-payment-date: u0
+      }
+    )
+    
+    (map-set beneficiary-sponsors
+      { beneficiary: beneficiary }
+      { sponsorship-id: sponsorship-id, sponsor-id: sponsor-id }
+    )
+    
+    (map-set sponsor-registry
+      { sponsor-id: sponsor-id }
+      (merge sponsor-data {
+        total-contributed: (+ (get total-contributed sponsor-data) sponsorship-amount),
+        sponsored-families: (+ (get sponsored-families sponsor-data) u1)
+      })
+    )
+    
+    (var-set total-sponsorships sponsorship-id)
+    (ok sponsorship-id)
+  )
+)
+
+(define-public (release-sponsorship-payment (sponsorship-id uint))
+  (let (
+    (sponsorship-data (unwrap! (map-get? sponsorship-agreements { sponsorship-id: sponsorship-id }) ERR_SPONSOR_NOT_FOUND))
+    (current-cycle (get-current-cycle))
+    (monthly-payment (get monthly-payment sponsorship-data))
+    (beneficiary (get beneficiary sponsorship-data))
+    (total-paid (get total-paid sponsorship-data))
+    (new-total-paid (+ total-paid monthly-payment))
+  )
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_UNAUTHORIZED)
+    (asserts! (get is-active sponsorship-data) ERR_SPONSORSHIP_INACTIVE)
+    (asserts! (not (is-sponsorship-expired sponsorship-id)) ERR_SPONSORSHIP_EXPIRED)
+    (asserts! (<= new-total-paid (get sponsorship-amount sponsorship-data)) ERR_INSUFFICIENT_SPONSOR_BALANCE)
+    
+    (try! (as-contract (ft-transfer? foodpass-token monthly-payment tx-sender beneficiary)))
+    
+    (map-set sponsorship-agreements
+      { sponsorship-id: sponsorship-id }
+      (merge sponsorship-data {
+        total-paid: new-total-paid,
+        last-payment-date: stacks-block-height
+      })
+    )
+    
+    (ok monthly-payment)
+  )
+)
+
+(define-public (distribute-donation-funds (recipient-list (list 20 principal)) (amount-per-recipient uint))
+  (let (
+    (total-amount (* (len recipient-list) amount-per-recipient))
+    (current-balance (var-get donation-fund-balance))
+  )
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_UNAUTHORIZED)
+    (asserts! (>= current-balance total-amount) ERR_INSUFFICIENT_BALANCE)
+    (asserts! (> amount-per-recipient u0) ERR_INVALID_AMOUNT)
+    
+    (var-set donation-fund-balance (- current-balance total-amount))
+    (fold distribute-donation-to-recipient recipient-list (ok amount-per-recipient))
+  )
+)
+
+(define-private (distribute-donation-to-recipient (recipient principal) (prev-result (response uint uint)))
+  (match prev-result
+    amount
+      (match (as-contract (ft-transfer? foodpass-token amount tx-sender recipient))
+        success (ok amount)
+        error (err error)
+      )
+    error (err error)
+  )
+)
+
+(define-public (terminate-sponsorship (sponsorship-id uint))
+  (let (
+    (sponsorship-data (unwrap! (map-get? sponsorship-agreements { sponsorship-id: sponsorship-id }) ERR_SPONSOR_NOT_FOUND))
+    (sponsor-id (get sponsor-id sponsorship-data))
+    (sponsor-data (unwrap! (map-get? sponsor-registry { sponsor-id: sponsor-id }) ERR_SPONSOR_NOT_FOUND))
+    (remaining-amount (- (get sponsorship-amount sponsorship-data) (get total-paid sponsorship-data)))
+    (beneficiary (get beneficiary sponsorship-data))
+  )
+    (asserts! (or (is-eq tx-sender (var-get contract-owner)) (is-eq tx-sender (get sponsor-address sponsor-data))) ERR_UNAUTHORIZED)
+    (asserts! (get is-active sponsorship-data) ERR_SPONSORSHIP_INACTIVE)
+    
+    (if (> remaining-amount u0)
+      (try! (as-contract (ft-transfer? foodpass-token remaining-amount tx-sender (get sponsor-address sponsor-data))))
+      true
+    )
+    
+    (map-set sponsorship-agreements
+      { sponsorship-id: sponsorship-id }
+      (merge sponsorship-data { is-active: false })
+    )
+    
+    (map-set sponsor-registry
+      { sponsor-id: sponsor-id }
+      (merge sponsor-data {
+        sponsored-families: (- (get sponsored-families sponsor-data) u1)
+      })
+    )
+    
+    (map-delete beneficiary-sponsors { beneficiary: beneficiary })
+    (ok remaining-amount)
+  )
+)
+
+(define-public (update-sponsor-status (sponsor-id uint) (is-active bool))
+  (let (
+    (sponsor-data (unwrap! (map-get? sponsor-registry { sponsor-id: sponsor-id }) ERR_SPONSOR_NOT_FOUND))
+  )
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_UNAUTHORIZED)
+    (map-set sponsor-registry
+      { sponsor-id: sponsor-id }
+      (merge sponsor-data { is-active: is-active })
+    )
+    (ok is-active)
+  )
+)
+
+(define-read-only (get-donation-details (donation-id uint))
+  (map-get? donation-registry { donation-id: donation-id })
+)
+
+(define-read-only (get-sponsor-details (sponsor-id uint))
+  (map-get? sponsor-registry { sponsor-id: sponsor-id })
+)
+
+(define-read-only (get-sponsorship-details (sponsorship-id uint))
+  (map-get? sponsorship-agreements { sponsorship-id: sponsorship-id })
+)
+
+(define-read-only (get-sponsor-by-address-info (sponsor-address principal))
+  (get-sponsor-by-address sponsor-address)
+)
+
+(define-read-only (get-beneficiary-sponsor (beneficiary principal))
+  (map-get? beneficiary-sponsors { beneficiary: beneficiary })
+)
+
+(define-read-only (get-total-donations)
+  (var-get total-donations)
+)
+
+(define-read-only (get-total-sponsors)
+  (var-get total-sponsors)
+)
+
+(define-read-only (get-total-sponsorships)
+  (var-get total-sponsorships)
+)
+
+(define-read-only (get-donation-fund-balance)
+  (var-get donation-fund-balance)
+)
+
+(define-read-only (is-sponsor-registered (sponsor-address principal))
+  (is-some (map-get? sponsor-address-lookup { sponsor-address: sponsor-address }))
+)
+
+
+
